@@ -288,6 +288,10 @@ TECH_MARKERS = re.compile(
     r"(?P<limit>以内|之内|内|以上|以下|之前|之后)?", re.I)
 PERIOD_MARKER = re.compile(rf"(?:{NUMBER}|{CN_NUMBER})\s*(?:{PERIOD}|(?:min|ms|h|s)(?![A-Za-z]))", re.I)
 HARD_BREAK = re.compile(r"[。；;！？!?\n]")
+INCIDENT_START = re.compile(
+    r"(?:(?:接到|收到)(?P<notice>[^，,。；;！？!?\n]{0,12}?(?:故障通知|报障|报修工单))"
+    r"|(?P<delivery>(?:故障通知|报障通知)送达[^，,。；;！？!?\n]{1,12}?)"
+    r"|(?P<occurrence>故障发生|发生故障)|(?P<reported>接报))(?:之日起|之时起|时起|后|时|起)")
 TERM_CLAUSE_BREAK = re.compile(r"[,，。.;；:：!?！？\n]+")
 GOVERNANCE = {"提交", "报送", "发出", "出具", "审核", "审批", "签批", "复核", "确认", "执行", "实施", "登记"}
 PREDICATE = re.compile(r"(?:(电话|书面|现场|远程|在线)\s*(?:进行|作出|予以)?\s*)?("
@@ -316,6 +320,26 @@ ROLE_WORD = re.compile(ROLE)
 STATED_ROLE = re.compile(rf"({ACTOR})(?:将|应当|应|须|需)?({ROLE})")
 WRITTEN_APPROVAL = re.compile(
     rf"(?:(?<![向给])({ACTOR})(?:的|以)?)?书面(?:形式|方式)?(?:的|予以|进行|作出)?(?:批准|同意|授权|许可|确认|审批)")
+# Only read an obligation where a clause or a named party introduces an action.
+# Bare 应 and 可 also occur within ordinary terms such as 应用 and 可靠性.
+STATED_FORCE = re.compile(
+    rf"(?:^|[,，。；;！？!?\n]|{ACTOR})\s*"
+    r"(?P<force>(?:(?:原则上)?(?:必须|须|应当|应|可以|可|力争|尽量|优先)|原则上)(?:优先)?)"
+    r"(?=\s*(?:在|于|按|向|先|尽快|及时|立即|提交|报送|签署|交付|开展|提供|安排|"
+    r"执行|实施|审核|复核|核对|完成|恢复|修复|响应|电话响应|到场|登记|记录))")
+FRONTED_DEFAULT = re.compile(rf"(^|[,，。；;！？!?\n])\s*原则上[,，]?\s*({ACTOR})")
+
+
+def incident_starts(text):
+    """Read explicit incident clock starts only in sentences with a stated duration."""
+    result = []
+    for sentence in HARD_BREAK.split(text):
+        if PERIOD_MARKER.search(sentence):
+            for match in INCIDENT_START.finditer(sentence):
+                # 接到 and 收到 share one notice category. Keep the source/object
+                # of the notice and the destination of any explicit delivery.
+                result.append((match.lastgroup, match["notice"] or match["delivery"] or ""))
+    return result
 
 
 def predicates(clause):
@@ -408,14 +432,23 @@ def commitment_change(original, start, end, replacement):
     def limits(text):
         return [LIMIT_MAP[m.group()] for m in LIMIT_MARKER.finditer(text)]
 
+    def stated_force(text):
+        text = FRONTED_DEFAULT.sub(r"\1\2原则上", text)
+        return [m["force"].replace("必须", "须").replace("应当", "应").replace("可以", "可")
+                for m in STATED_FORCE.finditer(text)]
+
     if markers(before) != markers(after):
         return "数值、单位、时限边界或技术指标标识有变，待确认"
     if limits(before) != limits(after) or NEGATION.findall(before) != NEGATION.findall(after):
         return "数值上下限、否定或适用范围的措辞有变，待确认"
     if logical_operators(before) != logical_operators(after):
         return "明确条件中的并列、择一关系有变，待确认"
+    if incident_starts(before) != incident_starts(after):
+        return "故障时限的起算事件、报障来源或通知送达对象有变，待确认"
     if WRITTEN_APPROVAL.findall(before) != WRITTEN_APPROVAL.findall(after):
         return "书面批准、确认或授权的要求或明确办理主体有变，待确认"
+    if stated_force(before) != stated_force(after):
+        return "明确动作的承诺强度或办理优先顺序有变，待确认"
     # Put the two explicit word orders into the same form for comparison only.
     before, after = (EXPANDED_PHONE_RESPONSE.sub(r"向\1作出电话响应", s) for s in (before, after))
     if PHONE_RESPONSE_TO.findall(before) != PHONE_RESPONSE_TO.findall(after):
