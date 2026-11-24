@@ -1,0 +1,4 @@
+interface:
+  display_name: "信息化标书去ai味"
+  short_description: "精简信息化技术标的模板化表述，保留原有格式，以 Word 修订和批注交付"
+  default_prompt: "用 $bid-polish-zh 轻改这份技术标，保留原格式和投标承诺，在 Word 中显示修订并就疑点添加批注。"
