@@ -17,6 +17,7 @@ import zipfile
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from itertools import combinations
 
 from lxml import etree as ET
@@ -287,11 +288,14 @@ TECH_MARKERS = re.compile(
     r"(?P<limit>以内|之内|内|以上|以下|之前|之后)?", re.I)
 PERIOD_MARKER = re.compile(rf"(?:{NUMBER}|{CN_NUMBER})\s*(?:{PERIOD}|(?:min|ms|h|s)(?![A-Za-z]))", re.I)
 HARD_BREAK = re.compile(r"[。；;！？!?\n]")
+TERM_CLAUSE_BREAK = re.compile(r"[,，。.;；:：!?！？\n]+")
 GOVERNANCE = {"提交", "报送", "发出", "出具", "审核", "审批", "签批", "复核", "确认", "执行", "实施", "登记"}
 PREDICATE = re.compile(r"(?:(电话|书面|现场|远程|在线)\s*(?:进行|作出|予以)?\s*)?("
                        + "|".join(sorted(GOVERNANCE)) + r"|到达现场|抵达现场|到场|响应|修复|恢复)")
 ACTOR = r"投标人|投标方|我方|采购人|采购方|委托方|委方|甲方|乙方|项目经理|运维人员|工程师|供应商|厂商|业主|业务主管|服务台"
 SUBJECT = re.compile(ACTOR)
+EXPANDED_PHONE_RESPONSE = re.compile(rf"以电话(?:方式|形式)向({ACTOR})(?:作出|予以|进行)?响应")
+PHONE_RESPONSE_TO = re.compile(rf"向({ACTOR})(?:作出|予以|进行)?电话响应")
 LOGIC = re.compile(r"(?:仅当|仅在|只有)([^。；;！？!?\n]{1,100}?)(?:时|方可|才能|才可|才允许)")
 LIMIT_GROUPS = {
     "lower_inclusive": ("不少于", "不低于", "至少", "大于等于", ">=", "≥"),
@@ -310,6 +314,8 @@ NEGATION = re.compile(r"不得|严禁|禁止|未经|无须|无需|无权|不能|
 ROLE = r"负责(?!人(?!员)|制)|配合(?!度)|协助"
 ROLE_WORD = re.compile(ROLE)
 STATED_ROLE = re.compile(rf"({ACTOR})(?:将|应当|应|须|需)?({ROLE})")
+WRITTEN_APPROVAL = re.compile(
+    rf"(?:(?<![向给])({ACTOR})(?:的|以)?)?书面(?:形式|方式)?(?:的|予以|进行|作出)?(?:批准|同意|授权|许可|确认|审批)")
 
 
 def predicates(clause):
@@ -408,6 +414,12 @@ def commitment_change(original, start, end, replacement):
         return "数值上下限、否定或适用范围的措辞有变，待确认"
     if logical_operators(before) != logical_operators(after):
         return "明确条件中的并列、择一关系有变，待确认"
+    if WRITTEN_APPROVAL.findall(before) != WRITTEN_APPROVAL.findall(after):
+        return "书面批准、确认或授权的要求或明确办理主体有变，待确认"
+    # Put the two explicit word orders into the same form for comparison only.
+    before, after = (EXPANDED_PHONE_RESPONSE.sub(r"向\1作出电话响应", s) for s in (before, after))
+    if PHONE_RESPONSE_TO.findall(before) != PHONE_RESPONSE_TO.findall(after):
+        return "电话响应的方式、对象或动作有变，待确认"
     old_deadlines, old_duties = bindings(before)
     new_deadlines, new_duties = bindings(after)
     if old_deadlines != new_deadlines:
@@ -724,10 +736,46 @@ class Document:
         atomic_create(path, write_to)
 
 
+def protected_term_change(terms, start, end, before, after):
+    """Require each touched occurrence to survive in the aligned text of this edit."""
+    touched = [entry for entry in terms if entry[0] < end and start < entry[1]]
+    if not touched:
+        return ""
+    matches = SequenceMatcher(None, before, after, autojunk=False).get_matching_blocks()
+    old_breaks = [m.start() for m in TERM_CLAUSE_BREAK.finditer(before)]
+    new_breaks = [m.start() for m in TERM_CLAUSE_BREAK.finditer(after)]
+    for left, right, term, source in touched:
+        lo, hi = max(start, left) - start, min(end, right) - start
+        # Reordering the object and verb may make the diff align other words
+        # instead. An exact, unique term in the same short clause is unambiguous.
+        if (not old_breaks and not new_breaks and start <= left and right <= end
+                and before.find(term) == before.rfind(term) == lo
+                and term in after and after.find(term) == after.rfind(term)):
+            continue
+        for old, new, length in matches:
+            if old <= lo and hi <= old + length:
+                # A term extending beyond the edit must still join its original
+                # prefix or suffix with no intervening letters.
+                if left < start and new != 0:
+                    continue
+                if right > end and new + length != len(after):
+                    continue
+                # A matching phrase in another surviving clause cannot stand in
+                # for the scoring term in the clause being revised.
+                if len(old_breaks) == len(new_breaks) and (
+                        sum(pos < lo for pos in old_breaks) != sum(pos < new + lo - old for pos in new_breaks)):
+                    continue
+                break
+        else:
+            return f"项目原词“{term}”发生变化，依据：{source}"
+    return ""
+
+
 def check_plan(plan, document):
     if not isinstance(plan, dict) or plan.get("source_sha256") != document.sha:
         raise ValueError("原稿 SHA-256 与计划不符，请重新 inspect。")
-    for group, keys in (("edits", ("p", "before", "after")), ("comments", ("p", "quote", "text"))):
+    for group, keys in (("edits", ("p", "before", "after")), ("comments", ("p", "quote", "text")),
+                        ("protected_terms", ("p", "term", "source"))):
         rows = plan.get(group, [])
         if not isinstance(rows, list):
             raise ValueError(f"{group} 必须是数组。")
@@ -739,9 +787,25 @@ def check_plan(plan, document):
             if group == "comments" and not row["text"].strip():
                 raise ValueError("批注正文不能为空。")
 
+    paragraphs = {rec.id: rec.text for rec in document.records}
+    terms_by_paragraph = {}
+    for row in plan.get("protected_terms", []):
+        pid, term, source = row["p"], row["term"], row["source"]
+        if not term.strip() or not source.strip():
+            raise ValueError("protected_terms 的项目原词和条款来源不能为空。")
+        if pid not in paragraphs or term not in paragraphs[pid]:
+            raise ValueError(f"protected_terms 无法在原稿段落 {pid} 定位“{term}”。")
+        text = paragraphs[pid]
+        entries = terms_by_paragraph.setdefault(pid, [])
+        pos = text.find(term)
+        while pos >= 0:
+            entries.append((pos, pos + len(term), term, source))
+            pos = text.find(term, pos + 1)
+    return terms_by_paragraph
+
 
 def apply_plan(document, plan, output, author):
-    check_plan(plan, document)
+    protected_terms = check_plan(plan, document)
     document.require_writable()
     xml_string(author)
     if not author.strip():
@@ -772,10 +836,12 @@ def apply_plan(document, plan, output, author):
             row.update(status="unchanged", revision_ids=[])
             continue
         if span:
-            reason = safety(rec, *span)
+            reason = protected_term_change(protected_terms.get(rec.id, ()), *span, row["before"], row["after"])
+            if not reason:
+                reason = safety(rec, *span)
             if not reason:
                 reason = commitment_change(rec.text, *span, row["after"])
-        if any(c in row["after"] for c in "\r\n\t"):
+        if not reason and any(c in row["after"] for c in "\r\n\t"):
             reason = "新文字含制表符或换行，须人工确认结构"
         if reason:
             row.update(status="skipped", reason=reason, revision_ids=[])

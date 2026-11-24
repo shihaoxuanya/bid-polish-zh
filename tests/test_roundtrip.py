@@ -193,12 +193,28 @@ class CommitmentReview(unittest.TestCase):
          "变更前，投标人审核方案，采购人执行。", "skipped"),
         ("postposed_deadline", "我方电话响应不超过30分钟。",
          "我方到场不超过30分钟。", "skipped"),
+        ("phone_word_order", "值班工程师应在30分钟内以电话方式向采购人作出响应。",
+         "值班工程师应在30分钟内向采购人作出电话响应。", "applied"),
+        ("phone_recipient", "接报后，我方在30分钟内以电话方式向采购人作出响应。",
+         "接报后，我方在30分钟内向供应商作出电话响应。", "skipped"),
+        ("phone_mode", "试运行期间，我方应在30分钟内以电话方式向采购人作出响应。",
+         "试运行期间，我方应在30分钟内向采购人作出响应。", "skipped"),
+        ("phone_action", "发生故障时，工程师应在30分钟内以电话方式向采购人作出响应。",
+         "发生故障时，工程师应在30分钟内到场修复。", "skipped"),
         ("both_conditions", "仅当账本平衡且抽样复核通过时，允许封存本批数据。",
          "仅当账本平衡或抽样复核通过时，允许封存本批数据。", "skipped"),
         ("prohibition", "采购人确认前，投标人不得执行变更。",
          "采购人确认前，投标人可以执行变更。", "skipped"),
         ("condition", "未经采购人书面确认，投标人不得执行变更。",
          "经采购人书面确认，投标人不得执行变更。", "skipped"),
+        ("written_approval", "经采购人书面批准后，实施单位开始切换。",
+         "经采购人批准后，实施单位开始切换。", "skipped"),
+        ("informal_assent", "经采购人书面批准后，我方启动迁移。",
+         "经采购人同意后，我方启动迁移。", "skipped"),
+        ("written_approval_owner", "经采购人书面批准后，我方开始切换。",
+         "经供应商书面批准后，我方开始切换。", "skipped"),
+        ("keep_written_approval", "经采购人书面批准后，实施单位开展切换工作。",
+         "经采购人书面批准后，实施单位开始切换。", "applied"),
         ("preposition", "系统故障时，工程师应于3小时内提交报告。",
          "系统故障时，工程师应在3小时内提交报告。", "applied"),
         ("active_voice", "演练前，由采购人审核清单，再由投标人执行。",
@@ -273,6 +289,96 @@ class CommitmentReview(unittest.TestCase):
                             for node in self.accepted_xml.iter(qn("w:ins"))))
         self.assertEqual(next(c.text for c in self.review.comments if c.author == PREVIOUS), "由采购人确认。")
         self.assertTrue(next(r for r in self.review.paragraphs[1].runs if r.text == "X-42").bold)
+
+
+class ProjectTerms(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temp = TemporaryDirectory()
+        cls.addClassCleanup(temp.cleanup)
+        cls.root = Path(temp.name)
+        cls.source = cls.root / "source.docx"
+        doc = Document()
+        doc.add_paragraph("为提升服务水平，值班工程师提供电话响应，并将本次电话响应的时间填写至故障工单中。")
+        doc.add_paragraph("我方对配置基线开展核对工作。")
+        doc.add_paragraph("培训示例中的电话响应使用测试号码。")
+        doc.add_paragraph("迁移前须核对配置基线。验收时核查记录。")
+        doc.save(cls.source)
+        info = json.loads(cli("bid_docx.py", "inspect", cls.source).stdout)
+        cls.ids = [r["id"] for r in info["paragraphs"]]
+        cls.digest = info["source_sha256"]
+
+    def test_scoped_terms_preserve_wording_and_allow_surrounding_edits(self):
+        first, second, third, fourth = self.ids
+        scoring = "评分表第3项"
+        appendix = "采购需求附件A第2段"
+        plan = {
+            "source_sha256": self.digest,
+            "protected_terms": [
+                {"p": first, "term": "电话响应", "source": scoring},
+                {"p": second, "term": "配置基线", "source": appendix},
+                {"p": fourth, "term": "配置基线", "source": appendix},
+            ],
+            "edits": [
+                {"p": first, "before": "为提升服务水平，", "after": ""},
+                {"p": first, "before": "响应，并", "after": "回复，并"},
+                {"p": second, "before": "对配置基线开展核对工作", "after": "核对配置基线"},
+                {"p": third, "before": "电话响应", "after": "电话回复"},
+                {"p": fourth, "before": "配置基线", "after": "当前配置"},
+                {"p": first, "before": "将本次电话响应的时间填写至故障工单中", "after": "在故障工单中记录电话响应时间"},
+            ],
+        }
+        plan_path = self.root / "plan.json"
+        tracked = self.root / "tracked.docx"
+        receipt = self.root / "receipt.json"
+        accepted = self.root / "accepted.docx"
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        out = cli("bid_docx.py", "apply", self.source, plan_path, "--out", tracked, "--author", AUTHOR)
+        receipt.write_text(out.stdout, encoding="utf-8")
+        edits = json.loads(out.stdout)["edits"]
+        self.assertEqual([e["status"] for e in edits], ["applied", "skipped", "applied", "applied", "skipped", "applied"])
+        notes = {c.comment_id: c.text for c in Document(tracked).comments}
+        for edit, term, source in ((edits[1], "电话响应", scoring), (edits[4], "配置基线", appendix)):
+            with self.subTest(term=term):
+                self.assertEqual(edit["anchor"], "quote")
+                self.assertEqual(edit["revision_ids"], [])
+                self.assertIn(term, notes[edit["comment_id"]])
+                self.assertIn(source, notes[edit["comment_id"]])
+        result = cli("verify_docx.py", self.source, plan_path, tracked, receipt, "--accepted", accepted)
+        self.assertTrue(json.loads(result.stdout)["verified"])
+        self.assertEqual([p.text for p in Document(accepted).paragraphs], [
+            "值班工程师提供电话响应，并在故障工单中记录电话响应时间。",
+            "我方核对配置基线。",
+            "培训示例中的电话回复使用测试号码。",
+            "迁移前须核对配置基线。验收时核查记录。",
+        ])
+
+    def test_moving_a_protected_term_to_another_sentence_is_flagged(self):
+        original = "迁移前须核对配置基线。验收时核查记录。"
+        plan = {"source_sha256": self.digest, "protected_terms": [
+            {"p": self.ids[3], "term": "配置基线", "source": "迁移评分项第2项"}], "edits": [
+            {"p": self.ids[3], "before": original, "after": "迁移前须核对配置。验收时核查配置基线。"}]}
+        plan_path, tracked = self.root / "move-term.json", self.root / "move-term.docx"
+        plan_path.write_text(json.dumps(plan), encoding="utf-8")
+        report = cli("bid_docx.py", "apply", self.source, plan_path, "--out", tracked)
+        edit = json.loads(report.stdout)["edits"][0]
+        self.assertEqual(edit["status"], "skipped")
+        self.assertEqual(edit["anchor"], "quote")
+        self.assertIn("配置基线", edit["reason"])
+        self.assertEqual(Document(tracked).paragraphs[3].text, original)
+
+    def test_invalid_term_scope_fails_before_writing(self):
+        plan_path = self.root / "invalid.json"
+        output = self.root / "invalid.docx"
+        for pid, term in (("P9999", "电话响应"), (self.ids[0], "配置基线")):
+            with self.subTest(pid=pid, term=term):
+                plan = {"source_sha256": self.digest,
+                        "protected_terms": [{"p": pid, "term": term, "source": "评分表第3项"}]}
+                plan_path.write_text(json.dumps(plan), encoding="utf-8")
+                out = cli("bid_docx.py", "apply", self.source, plan_path, "--out", output, check=False)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertIn(pid, json.loads(out.stdout)["error"])
+                self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":
